@@ -106,6 +106,13 @@ MODELS: dict[str, dict[str, Any]] = {
             "model_type": 'deit_tiny_patch16_224',
             "patch_size": None,
             "model_load_params": {"pretrained": True}}},
+    "dt8-f": {
+        "init_model": models.init_deit8,
+        "model_params": {
+            "model_seed": None, "num_classes": None,
+            "model_type": 'deit_tiny_patch16_224',
+            "patch_size": None,
+            "model_load_params": {"pretrained": True}}},
     "r18-f": {
         "init_model": models.init_resnet,
         "model_params": {

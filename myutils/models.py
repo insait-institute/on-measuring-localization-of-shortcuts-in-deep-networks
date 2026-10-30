@@ -232,6 +232,55 @@ def init_deit(
     return model
 
 
+def deit_to_sequential8(model: VisionTransformer) -> nn.Module:
+    """
+    Transform timm DeiT to a layer-wise format
+    """
+    num_blocks = len(model.blocks)
+    return nn.Sequential(
+        nn.Sequential(
+            nn.Sequential(
+                model.patch_embed,
+                PosEmbed(
+                    model.cls_token, model.reg_token,
+                    model.pos_embed, model.pos_drop, model.no_embed_class),
+                model.patch_drop,
+                model.norm_pre),
+            nn.Sequential(*model.blocks[:num_blocks//6]),
+            nn.Sequential(*model.blocks[num_blocks//6:2*num_blocks//6]),
+            nn.Sequential(*model.blocks[2*num_blocks//6:3*num_blocks//6]),
+            nn.Sequential(*model.blocks[3*num_blocks//6:4*num_blocks//6]),
+            nn.Sequential(*model.blocks[4*num_blocks//6:5*num_blocks//6]),
+            nn.Sequential(
+                *model.blocks[5*num_blocks//4:-1],
+                nn.Sequential(model.blocks[-1], model.norm))),
+        nn.Sequential(
+            nn.Sequential(
+                PoolToken(), model.fc_norm, model.head_drop, model.head)))
+
+
+def init_deit8(
+        rank: int,
+        init_dataloader: DataLoader,
+        gpu_x_transform: my.data.GPUTransform,
+        gpu_y_transform: my.data.GPUTransform,
+        init_x_batch: Tensor,
+        *, model_seed: Optional[int], num_classes: Optional[int],
+        model_type: str,
+        patch_size: Optional[tuple[int, int]],
+        model_load_params: dict[str, Any]
+        ) -> nn.Module:
+    """Initialize DeiT"""
+    my.utils.set_torch_seed(model_seed)
+    model = timm.create_model(model_type, **model_load_params)
+    if patch_size is not None:
+        model.set_input_size(init_x_batch.shape[2:], patch_size)
+    if num_classes is not None:
+        model.reset_classifier(num_classes)
+    model = deit_to_sequential8(model)
+    return model
+
+
 def convnext_to_sequential(model: ConvNeXt) -> nn.Module:
     """
     Transform torchvision ConvNeXt to a layer-wise format

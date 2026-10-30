@@ -1,6 +1,6 @@
 # Replication Files for the paper "On The Localization Of Shortcuts In Vision Models"
 
-This repository presents replication files for the paper "On The Localization Of Shortcuts In Vision Models" (2025)
+This repository presents replication files for the paper "On The Localization Of Shortcuts In Vision Models" (2026)
 
 ## Replication Instuctions
 
@@ -11,6 +11,7 @@ This repository presents replication files for the paper "On The Localization Of
 5. Run "c-datasets-and-tables.ipynb" to generate final tables
 6. Run "c-train-flex.py" and "c-train-freeze.py" with appropriate flags to train intervened models
 7. Run "c-val-flex.py" and "c-val-freeze.py" with appropriate flags to evaluate intervened models
+8. Run "c-train8.py" and "c-val8.py" with appropriate flags to train and evaluate a model with more blocks
 
 ## Note
 Supplementary contains the final error rates of models in the "checkpoints" folder.

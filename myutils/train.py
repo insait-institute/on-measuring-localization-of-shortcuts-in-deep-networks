@@ -345,6 +345,69 @@ def train_process(
     destroy_process_group()
 
 
+def train8_process(
+        rank: int, num_replicas: int,
+        port: int,
+        working_dir: str,
+        samples_name: str, model_name: str, optimizer_name: str,
+        epochs: int, samples: list[tuple]
+        ) -> None:
+    """Distributed training process"""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    init_process_group(backend="nccl", rank=rank, world_size=num_replicas)
+
+    sub_pos = samples_name.find("-")
+    if sub_pos != -1:
+        data_name = samples_name[:samples_name.find("-")]
+    else:
+        data_name = samples_name
+    full_optimizer_name = f"{optimizer_name}-{model_name}"
+    train_name = model_name[model_name.find("-")+1:]
+    if epochs <= 0:
+        epochs = config.EPOCHS[f"{data_name}-{train_name}"]
+    data_params = config.get_data_obj(data_name, 0.0)
+
+    freq_name = "c"
+
+    full_samples_name = f"{samples_name}-{freq_name}"
+    skew_params = config.get_skew(f"{data_name}-{freq_name}")
+    skewed_samples = datasets.add_skew_flag(samples, **skew_params)
+    data_obj = data_params["data_fn"](skewed_samples, **data_params["data_params"])
+    for split_name in ["c", "s"]:
+        if rank == 0:
+            print(
+                f"Samples: {full_samples_name}, Model: {model_name},",
+                f"Split: {split_name}")
+        for loader_seed, model_seed, train_seed in zip(
+            config.LOADER_SEEDS[data_name],
+            config.MODEL_SEEDS[data_name][model_name],
+            config.TRAIN_SEEDS[data_name][model_name]):
+            if rank == 0:
+                print(f"Model seed: {model_seed}")
+            train_params = {
+                **config.get_dataloader(
+                    "imagenet", loader_seed, 2**8//num_replicas),
+                **config.get_model(
+                    "dt8-f", model_seed, config.NUM_CLASSES[data_name]),
+                "optim_fn": optim.init_optim,
+                "optim_params": config.get_optimizer(full_optimizer_name),
+                "split_fn": models.not_layer_splits, "clean": split_name=="c",
+                "epochs": epochs,
+                "checkpoint_path":
+                    f"{working_dir}/checkpoints/{full_samples_name}-dt8-f-{optimizer_name}/s{model_seed}",
+                "checkpoint_interval": epochs,
+                "val_interval": epochs, "val_fn": noop,
+                "deterministic": True, "benchmark": False,
+                "train_seed": train_seed,
+                "zero_val": False, "range_fn": trange}
+            train_obj = init_train(
+                rank, num_replicas, *data_obj, **train_params)
+            train(*train_obj)
+
+    destroy_process_group()
+
+
 def test_process(
         rank: int, num_replicas: int, port: int, repeats: int,
         working_dir: str,
@@ -743,6 +806,118 @@ def val_process(
         with open(f'{checkpoint_path}/{split_name}-err.pickle', 'wb') as f:
             pickle.dump(val_losses, f, pickle.HIGHEST_PROTOCOL)
         with open(f'{checkpoint_path}/{split_name}-err-s.pickle', 'wb') as f:
+            pickle.dump(s_val_losses, f, pickle.HIGHEST_PROTOCOL)
+
+    destroy_process_group()
+
+
+def init_validate8(
+        rank: int, num_replicas: int,
+        dataloader: DataLoader,
+        gpu_x_transform: my.data.GPUTransform,
+        gpu_y_transform: my.data.GPUTransform,
+        model: nn.Module,
+        checkpoint_path: str,
+        samples_name: str, model_name: str, optimizer_name: str,
+        split_name: str,
+        *, loss_fn: Callable[[Tensor, Tensor], Tensor] = my.optim.error
+        ) -> tuple:
+    """Initialize distributed validation objects"""
+    sub_pos = samples_name.find("-")
+    data_name = samples_name[:samples_name.find("-")]
+    train_name = model_name[model_name.find("-")+1:]
+
+    epochs = config.EPOCHS[f"{data_name}-{train_name}"]
+    sub_names = get_sub_names(split_name, model)
+    model_seeds = config.MODEL_SEEDS[data_name][model_name]
+
+    models = [copy.deepcopy(model) for _ in model_seeds for _ in sub_names]
+    for i, sub_name in enumerate(sub_names):
+        for j, model_seed in enumerate(model_seeds):
+            models[i*len(model_seeds) + j].load_state_dict(torch.load(
+                f"{checkpoint_path}/{samples_name}-dt8-f-{optimizer_name}/s{model_seed}/{sub_name}-e{epochs}.pt",
+                map_location="cpu", weights_only=True))
+            models[i*len(model_seeds) + j].cuda(rank)
+
+    return (
+        dataloader, gpu_x_transform, gpu_y_transform,
+        models, len(model_seeds), loss_fn)
+
+
+def val8_process(
+        rank: int, num_replicas: int, port: int,
+        working_dir: str, split_name: str
+        ) -> None:
+    """Distributed validation process"""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    init_process_group(backend="nccl", rank=rank, world_size=num_replicas)
+
+    checkpoint_path = f"{working_dir}/checkpoints"
+    val_losses = {}
+    s_val_losses = {}
+    
+    i, samples_name = 3, "wb"
+
+    sub_pos = samples_name.find("-")
+    if sub_pos != -1:
+        data_name = samples_name[:samples_name.find("-")]
+    else:
+        data_name = samples_name
+    samples_params\
+        = config.get_samples(samples_name, f"{working_dir}/datasets")
+    samples_params["samples_params"]["split"] = "test"
+    samples\
+        = samples_params["samples_fn"](**samples_params["samples_params"])
+    data_params = config.get_data_obj(data_name, 1.0)
+    skewed_samples = datasets.add_skew_flag(samples, i+30, 1.0)
+    _, dataset, _, transform = data_params["data_fn"](
+        skewed_samples, **data_params["data_params"])
+    dataloader_params = config.get_dataloader(
+        "imagenet", 0, 2**8//num_replicas)
+    dataloader, gpu_x_transform, gpu_y_transform, init_x_batch\
+        = init_val_dataloader(
+            rank, num_replicas, dataset, transform,
+            **dataloader_params)
+
+
+    model_name = "dt8-f"
+
+    model_params = config.get_model(
+        model_name, 0, config.NUM_CLASSES[data_name])
+    model = model_params["init_model"](
+        rank, dataloader, gpu_x_transform, gpu_y_transform, init_x_batch,
+        **model_params["model_params"])
+
+    freq_name = "c"
+
+    full_samples_name = f"{samples_name}-{freq_name}"
+
+    optimizer_name = "adamw"
+
+    if rank == 0:
+        print(
+            f"Split: {split_name},",
+            f"Samples: {full_samples_name},",
+            f"Model: {model_name},",
+            f"Optimzier: {optimizer_name}")
+
+    val_obj = init_validate8(
+        rank, num_replicas,
+        dataloader, gpu_x_transform, gpu_y_transform,
+        model, checkpoint_path,
+        full_samples_name, "dtt-f", optimizer_name,
+        split_name)
+    val_loss, s_val_loss = validate(*val_obj)
+    val_losses[f"{full_samples_name}-{model_name}-{optimizer_name}"]\
+        = val_loss
+    s_val_losses[f"{full_samples_name}-{model_name}-{optimizer_name}"]\
+        = s_val_loss
+
+    if rank == 0:
+        with open(f'{checkpoint_path}/dt8-f-{split_name}-err.pickle', 'wb') as f:
+            pickle.dump(val_losses, f, pickle.HIGHEST_PROTOCOL)
+        with open(f'{checkpoint_path}/dt8-f-{split_name}-err-s.pickle', 'wb') as f:
             pickle.dump(s_val_losses, f, pickle.HIGHEST_PROTOCOL)
 
     destroy_process_group()
